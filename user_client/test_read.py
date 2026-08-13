@@ -138,6 +138,9 @@ def scan_db(db_root):
             continue
         cnt = 0
         for key, value in db.RangeIter():
+            # 该环境的 leveldb 包返回 bytearray（不可哈希），统一转成 bytes
+            key = bytes(key)
+            value = bytes(value)
             data.setdefault(key, []).append(value)
             cnt += 1
         print("  db3%d  : %d 条记录" % (i, cnt))
