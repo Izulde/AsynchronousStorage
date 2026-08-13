@@ -1,7 +1,6 @@
-from gevent import monkey;
+import fix_importlib;
 
 import time
-monkey.patch_all(thread=False)
 from gevent.server import StreamServer
 import pickle
 from typing import Callable

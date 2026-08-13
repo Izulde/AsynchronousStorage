@@ -96,7 +96,7 @@ def key_streamcipher_gen():
 
 def rsa_keygen():
     with open('rsa_key/PK.pem', 'rb') as f:
-        public_key = RSA.import_key(f.read())
+        public_key = RSA.importKey(f.read())
     return public_key
 
 
@@ -178,7 +178,7 @@ def main():
     threads = []
 
     id = 2
-    k = 3
+    k = 1
     b = [None] * (n + 10)
 
     for i in range(n):

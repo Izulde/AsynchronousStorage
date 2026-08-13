@@ -1,6 +1,6 @@
 from queue import Queue
 
-from gevent import monkey; monkey.patch_all(thread=False)
+import fix_importlib
 
 from datetime import datetime
 from collections import defaultdict

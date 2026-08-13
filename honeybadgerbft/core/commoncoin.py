@@ -1,4 +1,4 @@
-from gevent import monkey; monkey.patch_all(thread=False)
+import fix_importlib
 
 import logging
 from crypto.threshsig.boldyreva import g12deserialize, g12serialize
