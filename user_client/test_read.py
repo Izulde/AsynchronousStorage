@@ -6,12 +6,13 @@ test_read.py —— 绕过 Fabric/SGX 的读取验证脚本
 目的：在源码运行中证明「为什么把哈希 hm 发送给 BFT 副本，副本就能返回密文」。
 
 原理（对应源码位置）：
-  1. 写入：user_client/write_send.py 中生成 hm = SHA256(m)，打包
+  1. 写入：user_client/write_send.py 中生成 hm = SHA256(m)，用 _pack 打包
      (tyke=3, fields, hm, cm) 发送给 BFT 节点消息端口（30000-30600）。
-  2. 存储：共识完成后 struct_package/unpack_struct.py 的 _unpack() 调用
-     db_put((i, hm, cm))；dumbobft/core/dumbo.py 的 db_client() 线程执行
-     _write(i, hm, cm)，即 LevelDB 中以  hm 为 key、cm 为 value 存储。
-  3. 读取：本脚本向 BFT 节点发送 db_pake(4, hm, b'') —— tyke=4 表示 ABE 读取请求。
+  2. 存储：共识完成后 BFT 节点的 _unpack() 调用 db_put((i, hm, cm))；
+     dumbobft/core/dumbo.py 的 db_client() 线程执行 _write(i, hm, cm)，
+     即 LevelDB 中以 hm 为 key、cm 为 value 存储。
+  3. 读取：本脚本用 _pack(4, b'', hm, b'') 向 BFT 节点发送读取请求
+     —— tyke=4 表示 ABE 读取请求（与 inquire_chain.py 的 hm_encrypt 相同）。
   4. 副本处理：dumbo.py db_client() 中 `elif m == 4:` 分支：
          cm = _read(i, key)     # key 就是 hm
      _read() 内部（dumbobft/core/_leveldb.py）：
@@ -44,10 +45,14 @@ import os
 import sys
 from io import BytesIO
 
-# 只有解密需要这些模块；若只做"发送-接收-比对"可注释掉解密部分
-from struct_package.pack_struct import db_pake
-from struct_package.unpack_struct import attribute_unpack
-from crypto.ABE1.att_decrypt import decrypt
+from charm.toolbox.pairinggroup import PairingGroup
+from ABE.ac17 import AC17CPABE
+
+# user_client 目录下的本地模块（注意：该目录的代码与项目根目录版本不同，
+# 因此这里只 import 确定存在且签名稳定的函数）
+from struct_package.pack_struct import _pack          # 客户端 -> BFT 的打包格式
+from struct_package.unpack_struct import attribute_unpack  # 解包 ABE 密文
+from crypto.ABE1.att_decrypt import out_key, element_to_bytes, aes_decrypt
 
 # ---------------- 配置 ----------------
 BFT_MSG_HOST = '127.0.0.1'
@@ -88,9 +93,26 @@ def recv_exact(sock, n):
     return data
 
 
+def abe_decrypt(ctxt_msg, attr_list):
+    """
+    解密 attribute_unpack 解出的 [ctxt, encryption]。
+    直接使用 charm 的 AC17CPABE（与 user_client/crypto/ABE1/att_decrypt.py
+    的 decrypt 内部逻辑一致），避免依赖该文件里签名不一致的 decrypt 函数。
+    """
+    (pk, msk) = out_key()
+    ctxt = ctxt_msg[0]
+    encryption = ctxt_msg[1]
+    pairing_group = PairingGroup('SS512')
+    cpabe = AC17CPABE(pairing_group, 2)
+    key = cpabe.keygen(pk, msk, attr_list)
+    rec_msg = cpabe.decrypt(pk, ctxt, key)
+    aesKey_bytes = element_to_bytes(rec_msg)
+    aesKey_bytes32 = aesKey_bytes[0:32]
+    return aes_decrypt(aesKey_bytes32, encryption)
+
+
 def find_db_root():
     """定位 LevelDB 根目录（包含 db3{0..3} 的目录）。"""
-    cwd = os.getcwd()
     for cand in DB_ROOT_CANDIDATES:
         p = os.path.abspath(cand)
         if os.path.isdir(p):
@@ -123,8 +145,13 @@ def scan_db(db_root):
 
 
 def send_read_request(hm):
-    """向 BFT 节点发送 ABE 读取请求 db_pake(4, hm, b'')。"""
-    tx = db_pake(4, hm, b'')
+    """
+    向 BFT 节点发送 ABE 读取请求。
+    注意：必须用 _pack(tyke=4, fields=b'', key=hm, m=b'') 的 4 段格式
+    （与 inquire_chain.py 的 hm_encrypt 一致），因为 BFT 节点的 _unpack
+    按 [tyke | fields | key | m] 解析；db_pake 是副本回传数据用的 3 段格式。
+    """
+    tx = _pack(4, b'', hm, b'')
     sk = socket.socket()
     sk.connect((BFT_MSG_HOST, BFT_MSG_PORT))
     sk.sendall(get_len(tx))
@@ -177,7 +204,10 @@ class RecvServer(threading.Thread):
 
 
 def parse_db_response(body):
-    """解析 db_pake 格式：<i tyke><i len(hm)><hm><i len(cm)><cm>"""
+    """
+    解析副本回传包（db_pake 3 段格式，见 dumbo.py db_client）：
+    <i tyke><i len(hm)><hm><i len(cm)><cm>
+    """
     buf = BytesIO(body)
     (tyke,) = struct.unpack("<i", buf.read(4))
     (hm_len,) = struct.unpack("<i", buf.read(4))
@@ -208,7 +238,7 @@ def main():
               % (hm.hex()[:16], len(cms[0]), len(cms)))
 
     # ---- 2. 发送读取请求 ----
-    print("\n[2] 发送读取请求 db_pake(tyke=4, hm, b'') 到 BFT 节点 %s:%d"
+    print("\n[2] 发送读取请求 _pack(tyke=4, fields=b'', key=hm, m=b'') 到 BFT 节点 %s:%d"
           % (BFT_MSG_HOST, BFT_MSG_PORT))
     print("    tyke=4 表示 ABE 读取请求；hm 作为 key 参与后续查询")
     for hm in db_data:
@@ -229,6 +259,7 @@ def main():
         print("\n[错误] 未收到任何副本返回。请检查：")
         print("       - BFT 节点是否在运行（./run_local_network_test.sh 4 1 10 1000）")
         print("       - 发送请求后共识是否完成（节点终端应打印 'data consensus is complete'）")
+        print("       - 终端1 是否出现 'Client_send_db' 相关报错")
         sys.exit(1)
 
     # ---- 4. 逐条验证 ----
@@ -261,7 +292,7 @@ def main():
         # 4b. ABE 解密
         try:
             m = attribute_unpack(r_cm)
-            plain = decrypt(ATTR_LIST, m)
+            plain = abe_decrypt(m, ATTR_LIST)
         except Exception as e:
             print("  ② [!] 解密失败：%s" % e)
             print("     请确认写入时用的是 ABE 模式，且 attribute_key 密钥与写入时一致")
@@ -271,7 +302,8 @@ def main():
         h2 = _hash(plain)
         match = (h2 == r_hm)
         plain_str = plain.decode('utf-8', errors='replace')
-        print("  ② ABE 解密成功，明文 = %s" % (plain_str[:60] + ("..." if len(plain_str) > 60 else "")))
+        print("  ② ABE 解密成功，明文 = %s"
+              % (plain_str[:60] + ("..." if len(plain_str) > 60 else "")))
         print("  ③ SHA256(明文) = %s..." % h2.hex()[:16])
         print("     hm(数据库key) = %s..." % r_hm.hex()[:16])
         if match:
